@@ -23,7 +23,7 @@ class FeatureExtractor(nn.Module):
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.2),
 
-            nn.Flatten()
+            nn.Flatten(),
         )
 
     def forward(self, x):
@@ -31,7 +31,7 @@ class FeatureExtractor(nn.Module):
 
 
 class EnergyModel(nn.Module):
-    def __init__(self, in_channels=3, num_experts=128):
+    def __init__(self, in_channels=3, num_experts=512):
         super().__init__()
 
         self.feature_net = FeatureExtractor(in_channels)
@@ -47,22 +47,16 @@ class EnergyModel(nn.Module):
 
         x_flat = x.view(B, -1)
 
-        # term1 (scaled)
-        term1 = (x_flat ** 2).mean(dim=1)
+        term1 = (x_flat ** 2).sum(dim=1) / x_flat.size(1)
+        term2 = self.linear(x_flat).squeeze()
 
-        # term2 (scaled)
-        term2 = self.linear(x_flat).squeeze() / x_flat.size(1)
-
-        # feature extractor
         f = self.feature_net(x)
-
-        # stable expert term
         experts_out = self.experts(f)
-        term3 = F.softplus(experts_out).mean(dim=1)
+
+        term3 = F.softplus(experts_out).sum(dim=1) / experts_out.size(1)
 
         energy = term1 - term2 - term3
 
-        # clamp for stability
-        energy = 10 * torch.tanh(energy / 10)
+        energy = energy / 2
 
         return energy

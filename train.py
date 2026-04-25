@@ -93,12 +93,12 @@ def train(epochs=100,size=20000):
     G = Generator().to(device)
     E = EnergyModel().to(device)
 
-    # optimizers (stable)
-    opt_G = optim.Adam(G.parameters(), lr=5e-5, betas=(0.5, 0.999))
-    opt_E = optim.Adam(E.parameters(), lr=5e-5)
+    # optimizers
+    opt_E = optim.Adam(E.parameters(), lr=1e-4, betas=(0.5, 0.999))
+    opt_G = optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
 
     # data
-    loader = get_celeba_loader("data/celeba", subset_size=size)
+    loader = get_celeba_loader("data/celeba", batch_size=64, subset_size=size)
 
     # outputs
     os.makedirs("outputs", exist_ok=True)
@@ -108,6 +108,9 @@ def train(epochs=100,size=20000):
     loss_G_history = []
     E_real_history = []
     E_fake_history = []
+
+    ema_gap = 0
+    alpha = 0.9
 
     for epoch in range(epochs):
         loop = tqdm(loader, desc=f"Epoch [{epoch+1}/{epochs}]")
@@ -120,19 +123,24 @@ def train(epochs=100,size=20000):
         count = 0
 
         for images, _ in loop:
+            images = images + 0.01 * torch.randn_like(images)
             images = images.to(device)
             B = images.size(0)
 
             # ======================
             # Train Energy Model
             # ======================
-            z = torch.randn(B, 100).to(device)
+            z = torch.randn(B, 256).to(device)
             fake = G(z)
 
             E_real = E(images)
             E_fake = E(fake.detach())
 
-            loss_E = E_real.mean() - E_fake.mean()
+            margin = 4.0
+            loss_E = torch.relu(E_real.mean() - E_fake.mean() + margin)
+
+            reg = 0.001 * (E_real.pow(2).mean() + E_fake.pow(2).mean())
+            loss_E = loss_E + reg
 
             opt_E.zero_grad()
             loss_E.backward()
@@ -142,17 +150,26 @@ def train(epochs=100,size=20000):
             # ======================
             # Train Generator
             # ======================
-            z = torch.randn(B, 100).to(device)
-            fake = G(z)
+            for _ in range(1):
+                z = torch.randn(B, 256).to(device)
+                fake = G(z)
 
-            E_fake = E(fake)
+                E_fake = E(fake)
 
-            loss_G = E_fake.mean()
+                entropy = 0
+                for m in G.modules():
+                    if isinstance(m, torch.nn.BatchNorm2d) or isinstance(m, torch.nn.BatchNorm1d):
+                        entropy += torch.log(m.running_var + 1e-6).mean()
 
-            opt_G.zero_grad()
-            loss_G.backward()
-            torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0)
-            opt_G.step()
+                if epoch < 5:
+                    loss_G = E_fake.mean()
+                else:
+                    loss_G = E_fake.mean() - 0.01 * entropy
+
+                opt_G.zero_grad()
+                loss_G.backward()
+                torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0)
+                opt_G.step()
 
             # ======================
             # NaN safety
@@ -183,6 +200,16 @@ def train(epochs=100,size=20000):
         E_real_history.append(epoch_E_real / count)
         E_fake_history.append(epoch_E_fake / count)
 
+        print(
+            f"\nEpoch {epoch+1}: "
+            f"E_real={E_real_history[-1]:.4f}, "
+            f"E_fake={E_fake_history[-1]:.4f}"
+        )
+
+        gap = E_fake_history[-1] - E_real_history[-1]
+        ema_gap = alpha * ema_gap + (1 - alpha) * gap
+        print(f"gap: {gap:.3f}, ema_gap: {ema_gap:.3f}")
+
         # ======================
         # save samples
         # ======================
@@ -207,4 +234,4 @@ def train(epochs=100,size=20000):
 # MAIN
 # =========================
 if __name__ == "__main__":
-    train(epochs=100,size=20000)
+    train(epochs=40,size=20000)
