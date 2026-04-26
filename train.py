@@ -24,14 +24,15 @@ Key training steps per batch (Eq. 7, 9, 13, 14 in paper):
 """
 
 import argparse
+import gc
 import time
 import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
-from tqdm.auto import tqdm
+from torch.amp import GradScaler, autocast
+from tqdm import tqdm
 
 from models_energy import DeepEnergyModel
 from models_generator import DeepGenerativeModel
@@ -44,8 +45,10 @@ from utils import (
     InceptionFeatureExtractor,
     collect_inception_features,
     compute_fid,
+    compute_precision_recall,
 )
 from dataset import get_celeba_loader
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG  (edit these to customise the run)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -66,18 +69,24 @@ CONFIG = {
 
     # ── Training ──────────────────────────────────────────────────────────────
     "epochs":        100,               # total training epochs (set via CLI or edit here)
-    "lr_e":          2e-4,              # Adam lr for DEM  (DCGAN-style)
+    "lr_e":          1e-4,              # Adam lr for DEM — lower than DGM is key
     "lr_g":          2e-4,              # Adam lr for DGM
     "beta1":         0.5,               # Adam beta1 (DCGAN recommendation)
     "beta2":         0.999,
+    "wd_g":          1e-4,              # weight decay on DGM only (NOT on DEM)
     "lambda_H":      1e-3,              # entropy regularizer weight (Eq. 15)
+    "r1_gamma":      10.0,              # R1 gradient penalty coefficient for DEM stability
+    "r1_every":      4,                 # apply R1 every N batches (lazy regularisation)
+    "margin":        -1.0,              # DEM fake-energy margin; <=0 disables margin mode
     "n_gen_steps":   1,                 # DGM updates per DEM update
-    "clip_grad":     1.0,               # gradient clipping (stability)
+    "clip_grad_e":   5.0,               # DEM gradient clip (generous — let energy move)
+    "clip_grad_g":   1.0,               # DGM gradient clip
 
     # ── Sampling & logging ────────────────────────────────────────────────────
     "sample_every":  5,                 # save sample grid every N epochs
+    "save_checkpoint_every": 5,         # save numbered checkpoints every N epochs
     "n_samples":     64,                # images per sample grid
-    "fid_every":     5,                 # compute FID every N epochs (slow; set high to skip)
+    "fid_every":     5,                # compute FID every N epochs (slow; set high to skip)
     "fid_n_samples": 2000,              # samples for FID (2k is fast; 10k is more accurate)
     "log_interval":  50,                # print loss every N batches
     "output_dir":    "./outputs",
@@ -95,6 +104,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train DEM + DGM on CelebA")
     parser.add_argument("--epochs",       type=int,   default=None)
     parser.add_argument("--sample_every", type=int,   default=None)
+    parser.add_argument("--save_checkpoint_every", type=int, default=None)
     parser.add_argument("--fid_every",    type=int,   default=None)
     parser.add_argument("--batch_size",   type=int,   default=None)
     parser.add_argument("--subset_size",  type=int,   default=None)
@@ -103,6 +113,8 @@ def parse_args():
     parser.add_argument("--lr_e",         type=float, default=None)
     parser.add_argument("--lr_g",         type=float, default=None)
     parser.add_argument("--lambda_H",     type=float, default=None)
+    parser.add_argument("--r1_gamma",     type=float, default=None)
+    parser.add_argument("--margin",       type=float, default=None)
     parser.add_argument("--resume",       type=str,   default=None)
     parser.add_argument("--no_amp",       action="store_true")
     parser.add_argument("--seed",         type=int,   default=None)
@@ -111,9 +123,9 @@ def parse_args():
 
 def apply_args(cfg, args):
     """Override CONFIG with any CLI arguments that were explicitly set."""
-    for key in ["epochs", "sample_every", "fid_every", "batch_size",
+    for key in ["epochs", "sample_every", "save_checkpoint_every", "fid_every", "batch_size",
                 "subset_size", "data_root", "output_dir", "lr_e", "lr_g",
-                "lambda_H", "resume", "seed"]:
+                "lambda_H", "r1_gamma", "margin", "resume", "seed"]:
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val
@@ -126,75 +138,121 @@ def apply_args(cfg, args):
 # Training step helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train_dem_step(dem, dgm, real_imgs, scaler, opt_e, cfg, device):
+def r1_gradient_penalty(dem, real_imgs: torch.Tensor) -> torch.Tensor:
+    """
+    R1 gradient penalty (Mescheder et al., 2018).
+    Penalises the squared norm of the DEM gradient w.r.t. real images.
+    This is the correct way to regularise an energy function without killing
+    its gradient signal to the generator (unlike spectral norm).
+
+        R1 = (gamma/2) * E_{x~P_D}[ ||grad_x E(x)||^2 ]
+
+    Applied lazily every r1_every batches to save compute.
+    """
+    real_imgs = real_imgs.detach().requires_grad_(True)
+    e_real = dem(real_imgs).sum()
+    grads = torch.autograd.grad(
+        outputs=e_real,
+        inputs=real_imgs,
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    penalty = grads.pow(2).view(real_imgs.size(0), -1).sum(dim=1).mean()
+    return penalty
+
+
+def train_dem_step(dem, dgm, real_imgs, scaler_e, opt_e, cfg, device, batch_idx):
     """
     Update DEM via Eq. 7 + 9 in paper:
-        L_E = E[E(x+)]  -  E[E(x-)]
+        L_E = E[E(x+)]  -  E[E(x-)]  +  r1_penalty (every r1_every batches)
+
     Positive phase: push energy DOWN on real data.
     Negative phase: push energy UP on generated samples.
-    Returns scalar loss value and mean energies.
+
+    R1 gradient penalty (instead of spectral norm or weight decay on DEM):
+    - Keeps energy function Lipschitz near real data
+    - Does NOT collapse the energy landscape
+    - Does NOT kill the gradient signal to the generator
     """
     B = real_imgs.size(0)
+    apply_r1 = (batch_idx % cfg["r1_every"] == 0)
 
     opt_e.zero_grad(set_to_none=True)
-    with autocast(enabled=cfg["amp"]):
-        # Positive phase — real images
+
+    # ── Contrastive loss (Eq. 7) ──────────────────────────────────────────────
+    with autocast(device_type=device.type, enabled=cfg["amp"] and device.type == "cuda"):
         e_real = dem(real_imgs)                           # (B,)
 
-        # Negative phase — samples from generator (no grad through G here)
         with torch.no_grad():
             z = dgm.sample_z(B, device)
             fake_imgs = dgm(z)
 
         e_fake = dem(fake_imgs.detach())                  # (B,)
 
-        # Loss: want E_real < E_fake  =>  minimise E_real - E_fake
-        # (equivalent to MLE gradient Eq. 7)
-        loss_e = e_real.mean() - e_fake.mean()
+        # Optional margin loss for negative phase:
+        # margin > 0  => cap fake-energy pushing with hinge term.
+        # margin <= 0 => use standard contrastive objective.
+        margin = cfg.get("margin", -1.0)
+        if margin > 0:
+            loss_e = e_real.mean() + torch.nn.functional.relu(margin - e_fake).mean()
+        else:
+            loss_e = e_real.mean() - e_fake.mean()
 
-    scaler.scale(loss_e).backward()
-    if cfg["clip_grad"] > 0:
-        scaler.unscale_(opt_e)
-        nn.utils.clip_grad_norm_(dem.parameters(), cfg["clip_grad"])
-    scaler.step(opt_e)
-    scaler.update()
+    scaler_e.scale(loss_e).backward()
+
+    # ── R1 gradient penalty (lazy, full precision for stable autograd) ─────────
+    if apply_r1:
+        # Must be outside autocast for create_graph=True to work reliably
+        penalty = r1_gradient_penalty(dem, real_imgs)
+        r1_loss = (cfg["r1_gamma"] / 2.0) * penalty * cfg["r1_every"]
+        scaler_e.scale(r1_loss).backward()
+
+    if cfg["clip_grad_e"] > 0:
+        scaler_e.unscale_(opt_e)
+        nn.utils.clip_grad_norm_(dem.parameters(), cfg["clip_grad_e"])
+
+    scaler_e.step(opt_e)
+    scaler_e.update()
 
     return (
         loss_e.item(),
         e_real.mean().item(),
         e_fake.mean().item(),
+        e_real.var(unbiased=False).item(),
+        e_fake.var(unbiased=False).item(),
     )
 
 
-def train_dgm_step(dem, dgm, scaler, opt_g, cfg, device, batch_size):
+def train_dgm_step(dem, dgm, scaler_g, opt_g, cfg, device, batch_size):
     """
     Update DGM via Eq. 13 + 14 in paper:
-        L_G = E_z[E_Theta(G(z))]  +  lambda_H * (-H_approx)
-    The gradient of -log P_Theta(G(z)) = E_Theta(G(z)) w.r.t. phi is
-    computed by backprop through both G and E (Eq. 14).
-    Entropy regularizer (Eq. 15) is added to encourage diversity.
-    Returns scalar loss.
+        L_G = E_z[E_Theta(G(z))]  +  lambda_H * entropy_reg
+
+    The generator pushes samples toward low-energy regions of the DEM.
+    Gradient flows: z -> G(z) -> E(G(z)) -> backprop through both G and E.
+    The DEM must NOT be frozen here — its weights are fixed (opt_e already stepped)
+    but gradients flow through it to reach G.
     """
     opt_g.zero_grad(set_to_none=True)
-    with autocast(enabled=cfg["amp"]):
+    with autocast(device_type=device.type, enabled=cfg["amp"] and device.type == "cuda"):
         z = dgm.sample_z(batch_size, device)
-        fake_imgs = dgm(z)                        # (B, C, H, W)
+        fake_imgs = dgm(z)                               # (B, C, H, W)
 
-        # Term 1: push generated samples toward low energy regions
-        e_fake_for_g = dem(fake_imgs)             # (B,) — grad flows through G
+        # Term 1: push generated samples toward low energy regions (Eq. 14)
+        e_fake_for_g = dem(fake_imgs)                    # (B,) — grad flows through G
         gen_energy_loss = e_fake_for_g.mean()
 
-        # Term 2: entropy regularizer (Eq. 15) — maximise diversity
-        entropy_reg = dgm.entropy_regularizer()   # negative entropy to minimise
+        # Term 2: entropy regularizer (Eq. 15) — prevent mode collapse
+        entropy_reg = dgm.entropy_regularizer()
 
         loss_g = gen_energy_loss + cfg["lambda_H"] * entropy_reg
 
-    scaler.scale(loss_g).backward()
-    if cfg["clip_grad"] > 0:
-        scaler.unscale_(opt_g)
-        nn.utils.clip_grad_norm_(dgm.parameters(), cfg["clip_grad"])
-    scaler.step(opt_g)
-    scaler.update()
+    scaler_g.scale(loss_g).backward()
+    if cfg["clip_grad_g"] > 0:
+        scaler_g.unscale_(opt_g)
+        nn.utils.clip_grad_norm_(dgm.parameters(), cfg["clip_grad_g"])
+    scaler_g.step(opt_g)
+    scaler_g.update()
 
     return loss_g.item()
 
@@ -204,7 +262,7 @@ def train_dgm_step(dem, dgm, scaler, opt_g, cfg, device, batch_size):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def evaluate_fid(inception, dgm, loader, n_samples, fid_device, gen_device):
-    """Compute FID between real data and generated samples."""
+    """Compute FID plus precision/recall between real data and generated samples."""
     print(f"  [FID] Collecting {n_samples} real features...")
     real_feats = []
     collected = 0
@@ -236,8 +294,10 @@ def evaluate_fid(inception, dgm, loader, n_samples, fid_device, gen_device):
     fake_feats = np.concatenate(fake_feats, axis=0)[:n_samples]
 
     fid = compute_fid(real_feats, fake_feats)
+    precision, recall = compute_precision_recall(real_feats, fake_feats)
     print(f"  [FID] = {fid:.2f}")
-    return fid
+    print(f"  [PR ] precision={precision:.3f} recall={recall:.3f}")
+    return fid, precision, recall
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -252,10 +312,6 @@ def train(cfg: dict):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(cfg["device"])
-    print(f"[Device] {device}")
-    if device.type == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -264,8 +320,6 @@ def train(cfg: dict):
     loader = get_celeba_loader(
         subset_size=cfg["subset_size"],
         batch_size=cfg["batch_size"],
-        image_size=cfg["image_size"],
-        num_workers=cfg["num_workers"],
         data_path="./data/celeba"
     )
 
@@ -282,17 +336,28 @@ def train(cfg: dict):
         prior=cfg["prior"],
     ).to(device)
 
-    n_params_dem = sum(p.numel() for p in dem.parameters() if p.requires_grad)
-    n_params_dgm = sum(p.numel() for p in dgm.parameters() if p.requires_grad)
-    print(f"[Models] DEM params: {n_params_dem:,} | DGM params: {n_params_dgm:,}")
-
     # ── Optimisers ────────────────────────────────────────────────────────────
-    opt_e = torch.optim.Adam(dem.parameters(), lr=cfg["lr_e"],
-                              betas=(cfg["beta1"], cfg["beta2"]))
-    opt_g = torch.optim.Adam(dgm.parameters(), lr=cfg["lr_g"],
-                              betas=(cfg["beta1"], cfg["beta2"]))
+    # DEM: NO weight decay — it over-regularises the energy function and
+    #      suppresses the gradient signal reaching the generator.
+    #      Stability is handled by R1 gradient penalty instead.
+    opt_e = torch.optim.Adam(
+        dem.parameters(),
+        lr=cfg["lr_e"],
+        betas=(cfg["beta1"], cfg["beta2"]),
+    )
+    # DGM: small weight decay prevents generator weights from exploding
+    opt_g = torch.optim.Adam(
+        dgm.parameters(),
+        lr=cfg["lr_g"],
+        betas=(cfg["beta1"], cfg["beta2"]),
+        weight_decay=cfg["wd_g"],
+    )
 
-    scaler = GradScaler(enabled=cfg["amp"])
+    # Separate scalers per model — avoids AMP skipping DEM step when DGM
+    # has an inf/nan gradient (or vice versa), which caused silent training failures.
+    amp_enabled = cfg["amp"] and device.type == "cuda"
+    scaler_e = GradScaler(device=device.type, enabled=amp_enabled)
+    scaler_g = GradScaler(device=device.type, enabled=amp_enabled)
 
     # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 0
@@ -304,15 +369,9 @@ def train(cfg: dict):
 
     # ── Inception for FID (lazy init) ─────────────────────────────────────────
     inception = None
-    fid_device = torch.device("cpu")
+    fid_device = device if device.type == "cuda" else torch.device("cpu")
 
     # ── Training ──────────────────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"  Training DEM + DGM for {cfg['epochs']} epochs")
-    print(f"  Sample every: {cfg['sample_every']} epochs")
-    print(f"  FID every:    {cfg['fid_every']} epochs ({cfg['fid_n_samples']} samples)")
-    print(f"{'='*60}\n")
-
     dem.train()
     dgm.train()
 
@@ -322,6 +381,8 @@ def train(cfg: dict):
         epoch_g_loss = 0.0
         epoch_e_real = 0.0
         epoch_e_fake = 0.0
+        epoch_e_real_var = 0.0
+        epoch_e_fake_var = 0.0
         n_batches = 0
 
         progress = tqdm(
@@ -337,20 +398,22 @@ def train(cfg: dict):
             B = real_imgs.size(0)
 
             # ── 1. Update DEM ────────────────────────────────────────────────
-            loss_e, e_real, e_fake = train_dem_step(
-                dem, dgm, real_imgs, scaler, opt_e, cfg, device
+            loss_e, e_real, e_fake, e_real_var, e_fake_var = train_dem_step(
+                dem, dgm, real_imgs, scaler_e, opt_e, cfg, device, batch_idx
             )
 
             # ── 2. Update DGM (n_gen_steps times) ───────────────────────────
             loss_g = 0.0
             for _ in range(cfg["n_gen_steps"]):
-                loss_g += train_dgm_step(dem, dgm, scaler, opt_g, cfg, device, B)
+                loss_g += train_dgm_step(dem, dgm, scaler_g, opt_g, cfg, device, B)
             loss_g /= cfg["n_gen_steps"]
 
             epoch_e_loss += loss_e
             epoch_g_loss += loss_g
             epoch_e_real += e_real
             epoch_e_fake += e_fake
+            epoch_e_real_var += e_real_var
+            epoch_e_fake_var += e_fake_var
             n_batches += 1
 
             progress.set_postfix(
@@ -367,15 +430,23 @@ def train(cfg: dict):
         avg_g_loss = epoch_g_loss / n_batches
         avg_e_real = epoch_e_real / n_batches
         avg_e_fake = epoch_e_fake / n_batches
+        avg_e_real_var = epoch_e_real_var / n_batches
+        avg_e_fake_var = epoch_e_fake_var / n_batches
         gap        = avg_e_real - avg_e_fake   # ideally negative & stable
 
         # ── FID ──────────────────────────────────────────────────────────────
         fid = float("nan")
+        precision = float("nan")
+        recall = float("nan")
         if epoch % cfg["fid_every"] == 0:
             if inception is None:
-                print("  [FID] Loading InceptionV3 on CPU...")
-                inception = InceptionFeatureExtractor(fid_device)
-            fid = evaluate_fid(
+                print(f"  [FID] Loading InceptionV3 on {fid_device}...")
+                inception = InceptionFeatureExtractor(torch.device("cpu"))
+
+            if fid_device.type == "cuda":
+                inception = inception.to(fid_device)
+
+            fid, precision, recall = evaluate_fid(
                 inception,
                 dgm,
                 loader,
@@ -383,6 +454,11 @@ def train(cfg: dict):
                 fid_device=fid_device,
                 gen_device=device,
             )
+
+            if fid_device.type == "cuda":
+                inception = inception.to(torch.device("cpu"))
+                gc.collect()
+                torch.cuda.empty_cache()
 
         elapsed = time.time() - t0
 
@@ -392,8 +468,12 @@ def train(cfg: dict):
             "g_loss": avg_g_loss,
             "e_real": avg_e_real,
             "e_fake": avg_e_fake,
+            "e_real_var": avg_e_real_var,
+            "e_fake_var": avg_e_fake_var,
             "gap":    gap,
             "fid":    fid if not (fid != fid) else "nan",  # NaN check
+            "precision": precision if not (precision != precision) else "nan",
+            "recall": recall if not (recall != recall) else "nan",
         }
         logger.log(epoch, metrics, elapsed)
 
@@ -402,29 +482,25 @@ def train(cfg: dict):
             save_samples(dgm, cfg["n_samples"], device, str(output_dir), epoch)
 
         # ── Checkpoint ───────────────────────────────────────────────────────
-        save_checkpoint(
-            {
-                "epoch": epoch,
-                "dem":   dem.state_dict(),
-                "dgm":   dgm.state_dict(),
-                "opt_e": opt_e.state_dict(),
-                "opt_g": opt_g.state_dict(),
-                "cfg":   cfg,
-            },
-            str(output_dir / "checkpoints" / f"ckpt_epoch_{epoch:04d}.pt"),
-        )
-        # Keep latest checkpoint separately for easy resume
-        save_checkpoint(
-            {
-                "epoch": epoch,
-                "dem":   dem.state_dict(),
-                "dgm":   dgm.state_dict(),
-                "opt_e": opt_e.state_dict(),
-                "opt_g": opt_g.state_dict(),
-                "cfg":   cfg,
-            },
+        ckpt_data = {
+                "epoch":    epoch,
+                "dem":      dem.state_dict(),
+                "dgm":      dgm.state_dict(),
+                "opt_e":    opt_e.state_dict(),
+                "opt_g":    opt_g.state_dict(),
+                "scaler_e": scaler_e.state_dict(),
+                "scaler_g": scaler_g.state_dict(),
+                "cfg":      cfg,
+            }
+        if epoch % cfg["save_checkpoint_every"] == 0:
+            save_checkpoint(
+                ckpt_data,
+                str(output_dir / "checkpoints" / f"ckpt_epoch_{epoch:04d}.pt"),
+            )
+        save_checkpoint(ckpt_data,
             str(output_dir / "checkpoints" / "latest.pt"),
         )
+        print(f"Epoch: {epoch} done")
 
     # ── Post-training: final samples + metrics plot ───────────────────────────
     print("\n[Training complete] Saving final samples and metrics plot...")

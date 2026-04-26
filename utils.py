@@ -29,6 +29,43 @@ import matplotlib.ticker as ticker
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Config helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_scalar(value: str):
+    """Parse a scalar from a simple YAML-like key:value value string."""
+    value = value.strip()
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    if value.lower() in {"null", "none", "~"}:
+        return None
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        return value[1:-1]
+
+    try:
+        if "." in value or "e" in value.lower():
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
+
+
+def load_base_config(config_path: Path) -> Dict:
+    """Load a flat key:value config file such as config/base.yaml."""
+    cfg = {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, val = line.split(":", 1)
+            cfg[key.strip()] = parse_scalar(val)
+    return cfg
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -143,6 +180,55 @@ def compute_fid(
     return fid
 
 
+def compute_precision_recall(
+    real_feats: np.ndarray,
+    fake_feats: np.ndarray,
+    k: int = 10,
+) -> tuple[float, float]:
+    """
+    Compute improved precision and recall on feature embeddings.
+
+    Precision: fraction of generated samples that lie within the manifold of real data.
+    Recall: fraction of real samples covered by the generated manifold.
+    """
+    if len(real_feats) <= k or len(fake_feats) <= k:
+        return float("nan"), float("nan")
+
+    real_feats = np.asarray(real_feats)
+    fake_feats = np.asarray(fake_feats)
+
+    rr = _pairwise_distances(real_feats, real_feats)
+    np.fill_diagonal(rr, np.inf)
+    r_radius = np.partition(rr, k - 1, axis=1)[:, k - 1]
+
+    ff = _pairwise_distances(fake_feats, fake_feats)
+    np.fill_diagonal(ff, np.inf)
+    f_radius = np.partition(ff, k - 1, axis=1)[:, k - 1]
+
+    rf = _pairwise_distances(real_feats, fake_feats)
+
+    precision = np.mean(np.any(rf <= r_radius[:, None], axis=0))
+    recall = np.mean(np.any(rf <= f_radius[None, :], axis=1))
+    return float(precision), float(recall)
+
+
+def _pairwise_distances(x: np.ndarray, y: np.ndarray, chunk_size: int = 256) -> np.ndarray:
+    """Compute pairwise Euclidean distances without external dependencies."""
+    x = np.asarray(x, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    x_norm = np.sum(x * x, axis=1, keepdims=True)
+    y_norm = np.sum(y * y, axis=1, keepdims=True).T
+
+    distances = np.empty((x.shape[0], y.shape[0]), dtype=np.float32)
+    for start in range(0, x.shape[0], chunk_size):
+        end = min(start + chunk_size, x.shape[0])
+        d2 = x_norm[start:end] + y_norm - 2.0 * (x[start:end] @ y.T)
+        np.maximum(d2, 0.0, out=d2)
+        np.sqrt(d2, out=d2)
+        distances[start:end] = d2
+    return distances
+
+
 @torch.no_grad()
 def collect_inception_features(
     inception: InceptionFeatureExtractor,
@@ -186,7 +272,20 @@ def collect_inception_features(
 class MetricLogger:
     """Logs per-epoch metrics to a CSV file and keeps them in memory."""
 
-    FIELDS = ["epoch", "e_loss", "g_loss", "e_real", "e_fake", "gap", "fid", "elapsed_s"]
+    FIELDS = [
+        "epoch",
+        "e_loss",
+        "g_loss",
+        "e_real",
+        "e_fake",
+        "e_real_var",
+        "e_fake_var",
+        "gap",
+        "fid",
+        "precision",
+        "recall",
+        "elapsed_s",
+    ]
 
     def __init__(self, log_path: str):
         self.log_path = Path(log_path)
@@ -259,26 +358,40 @@ def plot_training_metrics(logger: MetricLogger, output_dir: str):
         return
 
     records = logger.records
-    epochs  = [int(r["epoch"])         for r in records]
-    e_loss  = [float(r["e_loss"])      for r in records]
-    g_loss  = [float(r["g_loss"])      for r in records]
-    e_real  = [float(r["e_real"])      for r in records]
-    e_fake  = [float(r["e_fake"])      for r in records]
-    gap     = [float(r["gap"])         for r in records]
-    fid     = [float(r["fid"])         for r in records if r["fid"] not in ("nan", "")]
+    epochs      = [int(r["epoch"]) for r in records]
+    e_loss      = [float(r["e_loss"]) for r in records]
+    g_loss      = [float(r["g_loss"]) for r in records]
+    e_real      = [float(r["e_real"]) for r in records]
+    e_fake      = [float(r["e_fake"]) for r in records]
+    e_real_var  = [float(r.get("e_real_var", "nan")) for r in records]
+    e_fake_var  = [float(r.get("e_fake_var", "nan")) for r in records]
+    gap         = [float(r["gap"]) for r in records]
+    fid         = [float(r["fid"]) for r in records if r["fid"] not in ("nan", "")]
+    precision   = [float(r["precision"]) for r in records if r.get("precision", "nan") not in ("nan", "")]
+    recall      = [float(r["recall"]) for r in records if r.get("recall", "nan") not in ("nan", "")]
 
     fid_epochs = [int(r["epoch"]) for r in records if r["fid"] not in ("nan", "")]
+    pr_epochs = [int(r["epoch"]) for r in records if r.get("precision", "nan") not in ("nan", "")]
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 14))
     fig.suptitle("DEM + DGM Training Metrics", fontsize=16, fontweight="bold")
 
-    _plot(axes[0, 0], epochs, e_loss,  "Energy Model Loss",      "E_loss",  "steelblue")
-    _plot(axes[0, 1], epochs, g_loss,  "Generator Loss",         "G_loss",  "darkorange")
-    _plot(axes[1, 0], epochs, e_real,  "Mean Energy (Real)",     "E_real",  "seagreen")
-    _plot(axes[1, 1], epochs, e_fake,  "Mean Energy (Fake)",     "E_fake",  "tomato")
-    _plot(axes[2, 0], epochs, gap,     "Energy Gap (Real-Fake)", "Gap",     "mediumpurple")
+    ax_loss = axes[0, 0]
+    ax_loss.plot(epochs, e_loss, color="steelblue", linewidth=2, label="E_loss")
+    ax_loss.plot(epochs, g_loss, color="darkorange", linewidth=2, label="G_loss")
+    ax_loss.set_title("Energy / Generator Loss", fontweight="bold")
+    ax_loss.set_xlabel("Epoch")
+    ax_loss.set_ylabel("Loss")
+    ax_loss.grid(True, alpha=0.3)
+    ax_loss.legend()
 
-    ax_fid = axes[2, 1]
+    _plot(axes[0, 1], epochs, e_real,      "Mean Energy (Real)",   "E_real",     "seagreen")
+    _plot(axes[0, 2], epochs, e_fake,      "Mean Energy (Fake)",   "E_fake",     "tomato")
+    _plot(axes[1, 0], epochs, e_real_var,   "Energy Variance (Real)", "E_real_var", "forestgreen")
+    _plot(axes[1, 1], epochs, e_fake_var,   "Energy Variance (Fake)", "E_fake_var", "firebrick")
+    _plot(axes[1, 2], epochs, gap,          "Energy Gap (Real-Fake)", "Gap",        "mediumpurple")
+
+    ax_fid = axes[2, 0]
     if fid:
         ax_fid.plot(fid_epochs, fid, color="goldenrod", linewidth=2, marker="o",
                     markersize=4)
@@ -290,6 +403,30 @@ def plot_training_metrics(logger: MetricLogger, output_dir: str):
         ax_fid.text(0.5, 0.5, "FID not computed", ha="center", va="center",
                     transform=ax_fid.transAxes, fontsize=12)
         ax_fid.set_title("FID")
+
+    ax_precision = axes[2, 1]
+    if precision:
+        ax_precision.plot(pr_epochs, precision, color="slateblue", linewidth=2, marker="o", markersize=4)
+        ax_precision.set_title("Precision", fontweight="bold")
+        ax_precision.set_xlabel("Epoch")
+        ax_precision.set_ylabel("Precision")
+        ax_precision.grid(True, alpha=0.3)
+    else:
+        ax_precision.text(0.5, 0.5, "Precision not computed", ha="center", va="center",
+                          transform=ax_precision.transAxes, fontsize=12)
+        ax_precision.set_title("Precision")
+
+    ax_recall = axes[2, 2]
+    if recall:
+        ax_recall.plot(pr_epochs, recall, color="crimson", linewidth=2, marker="o", markersize=4)
+        ax_recall.set_title("Recall", fontweight="bold")
+        ax_recall.set_xlabel("Epoch")
+        ax_recall.set_ylabel("Recall")
+        ax_recall.grid(True, alpha=0.3)
+    else:
+        ax_recall.text(0.5, 0.5, "Recall not computed", ha="center", va="center",
+                       transform=ax_recall.transAxes, fontsize=12)
+        ax_recall.set_title("Recall")
 
     plt.tight_layout()
     out_path = Path(output_dir) / "training_metrics.png"
@@ -314,7 +451,8 @@ def _plot(ax, x, y, title, ylabel, color):
 def save_checkpoint(state: dict, path: str):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, path)
-    print(f"[Checkpoint] Saved -> {path}")
+    if Path(path).name != "latest.pt":
+        print(f"[Checkpoint] Saved -> {path}")
 
 
 def load_checkpoint(path: str, dem, dgm, opt_e, opt_g, device) -> int:

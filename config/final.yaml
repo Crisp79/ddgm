@@ -1,0 +1,40 @@
+# Base training configuration mirrored from train.py CONFIG
+
+data_root: ./data
+subset_size: 20000
+image_size: 64
+batch_size: 64
+num_workers: 4
+
+n_experts: 1024
+feature_dim: 1024
+latent_dim: 100
+prior: normal
+sigma: 1.0
+
+epochs: 200
+lr_e: 5e-5
+lr_g: 0.0002
+beta1: 0.5
+beta2: 0.999
+wd_g: 0.0001
+lambda_H: 0.001
+r1_gamma: 10.0
+r1_every: 4
+margin: -1
+n_gen_steps: 1
+clip_grad_e: 1.0
+clip_grad_g: 1.0
+
+sample_every: 5
+save_checkpoint_every: 5
+n_samples: 64
+fid_every: 5
+fid_n_samples: 2000
+log_interval: 50
+output_dir: ./outputs/final
+
+seed: 42
+amp: true
+resume: null
+device: cuda
