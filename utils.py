@@ -66,57 +66,6 @@ def load_base_config(config_path: Path) -> Dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Dataset
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_celeba_loader(
-    root: str,
-    subset_size: int = 20_000,
-    batch_size: int = 64,
-    image_size: int = 64,
-    num_workers: int = 4,
-    split: str = "train",
-) -> DataLoader:
-    """
-    CelebA dataloader with optional subset.
-
-    Args:
-        root        : path to CelebA dataset root (parent of 'celeba/' folder)
-        subset_size : number of images to use (≤ full split size). Pass -1 for full.
-        batch_size  : mini-batch size
-        image_size  : spatial resolution (64 for paper experiments)
-        num_workers : DataLoader workers (keep ≤ 4 on laptop)
-        split       : 'train' | 'valid' | 'test' | 'all'
-    Returns:
-        DataLoader
-    """
-    tf = transforms.Compose([
-        transforms.Resize(image_size),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # -> [-1, 1]
-    ])
-
-    dataset = datasets.CelebA(root=root, split=split, transform=tf, download=False)
-
-    if 0 < subset_size < len(dataset):
-        indices = torch.randperm(len(dataset))[:subset_size].tolist()
-        dataset = Subset(dataset, indices)
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=(num_workers > 0),
-    )
-    print(f"[Dataset] Using {len(dataset):,} images | {len(loader)} batches/epoch")
-    return loader
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # FID (lightweight, InceptionV3-based)
 # ──────────────────────────────────────────────────────────────────────────────
 

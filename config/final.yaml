@@ -6,24 +6,24 @@ image_size: 64
 batch_size: 64
 num_workers: 4
 
-n_experts: 1024
-feature_dim: 1024
-latent_dim: 100
+n_experts: 512
+feature_dim: 512
+latent_dim: 512
 prior: normal
 sigma: 1.0
 
 epochs: 200
-lr_e: 5e-5
-lr_g: 0.0002
+lr_e: 1e-4
+lr_g: 2e-4
 beta1: 0.5
 beta2: 0.999
-wd_g: 0.0001
-lambda_H: 0.001
+wd_g: 0.0
+lambda_H: 0.0002
 r1_gamma: 10.0
 r1_every: 4
 margin: -1
 n_gen_steps: 1
-clip_grad_e: 1.0
+clip_grad_e: 5.0
 clip_grad_g: 1.0
 
 sample_every: 5
