@@ -414,3 +414,69 @@ def load_checkpoint(path: str, dem, dgm, opt_e, opt_g, device) -> int:
     epoch = ckpt.get("epoch", 0)
     print(f"[Checkpoint] Resumed from epoch {epoch} -> {path}")
     return epoch
+
+import os
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def plot_ablation_cards(df, params_dict, figsize=(28, 10), title_fontsize=24, metrics_fontsize=16):
+    """
+    Plots ablation cards with a cropped bottom to remove extra whitespace.
+    """
+    n = len(df)
+    # Reduced the bottom ratio from 1.5 to 1.1 to tighten the layout
+    fig, axes = plt.subplots(2, n, figsize=figsize, gridspec_kw={'height_ratios': [1, 1.1]})
+
+    if n == 1:
+        axes = axes.reshape(2, 1)
+
+    for i, row in df.reset_index(drop=True).iterrows():
+        exp_name = row["exp_name"]
+        
+        # 1. Top row: Experiment Name and Image
+        axes[0, i].set_title(exp_name, fontsize=title_fontsize, pad=20, fontweight="bold")
+        
+        img_path = os.path.join(row["output_dir"], "samples", "epoch_0030.png")
+        try:
+            if not os.path.exists(img_path):
+                raise FileNotFoundError()
+            img = plt.imread(img_path)
+            axes[0, i].imshow(img)
+        except Exception:
+            axes[0, i].text(0.5, 0.5, "Image Not Found", ha="center", va="center", fontsize=metrics_fontsize)
+        axes[0, i].axis("off")
+
+        # 2. Bottom row: Metrics + Multi-line Parameter Changes
+        axes[1, i].axis("off")
+        
+        run_params = params_dict.get(exp_name, {})
+        if not run_params:
+            params_text = "Changes:\nNone (Baseline)"
+        else:
+            formatted_params = "\n".join([f"{k}: {v}" for k, v in run_params.items()])
+            params_text = f"Changes:\n{formatted_params}"
+
+        text = (
+            f"E-Loss: {row['e_loss']:.4f}\n"
+            f"G-Loss: {row['g_loss']:.4f}\n"
+            f"E-Real: {row['e_real']:.4f}\n"
+            f"E-Fake: {row['e_fake']:.4f}\n"
+            f"Gap: {row['gap']:.4f}\n"
+            f"FID: {row['fid']:.4f}\n\n"
+            f"{params_text}"
+        )
+        
+        axes[1, i].text(
+            0.5, 1.0, # Top aligned
+            text,
+            ha="center", va="top",
+            fontsize=metrics_fontsize,
+            linespacing=2.8
+        )
+
+    # hspace=0 ensures there is no gap between images and text
+    plt.subplots_adjust(hspace=0, wspace=0.1, bottom=0.2) 
+    
+    # Alternatively, you can use bbox_inches='tight' when saving or showing
+    plt.show()
+
