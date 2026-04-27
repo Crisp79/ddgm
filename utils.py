@@ -1,39 +1,18 @@
-"""
-utils.py
-========
-Utility functions for the DEM+DGM training pipeline:
-  - CelebA dataset loader (subset)
-  - FID computation (Frechet Inception Distance)
-  - Metric logging / CSV export
-  - Sample grid saving
-  - Training plot generation
-"""
-
 import os
 import csv
-import math
-import time
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Dict, List
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision
 from scipy.linalg import sqrtm
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
-from torchvision.utils import save_image, make_grid
+from torchvision.utils import save_image
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
 def parse_scalar(value: str):
-    """Parse a scalar from a simple YAML-like key:value value string."""
     value = value.strip()
     if value.lower() in {"true", "false"}:
         return value.lower() == "true"
@@ -53,7 +32,6 @@ def parse_scalar(value: str):
 
 
 def load_base_config(config_path: Path) -> Dict:
-    """Load a flat key:value config file such as config/base.yaml."""
     cfg = {}
     with open(config_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -65,25 +43,33 @@ def load_base_config(config_path: Path) -> Dict:
     return cfg
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# FID (lightweight, InceptionV3-based)
-# ──────────────────────────────────────────────────────────────────────────────
-
 class InceptionFeatureExtractor(nn.Module):
-    """Wraps InceptionV3 to extract pool3 features (2048-d) for FID."""
-
     def __init__(self, device: torch.device):
         super().__init__()
         from torchvision.models import inception_v3, Inception_V3_Weights
+
         model = inception_v3(weights=Inception_V3_Weights.DEFAULT)
         model.eval()
-        # Remove final classification head; keep up to avgpool
+
         self.features = nn.Sequential(
-            model.Conv2d_1a_3x3, model.Conv2d_2a_3x3, model.Conv2d_2b_3x3,
-            nn.MaxPool2d(3, 2), model.Conv2d_3b_1x1, model.Conv2d_4a_3x3,
-            nn.MaxPool2d(3, 2), model.Mixed_5b, model.Mixed_5c, model.Mixed_5d,
-            model.Mixed_6a, model.Mixed_6b, model.Mixed_6c, model.Mixed_6d,
-            model.Mixed_6e, model.Mixed_7a, model.Mixed_7b, model.Mixed_7c,
+            model.Conv2d_1a_3x3,
+            model.Conv2d_2a_3x3,
+            model.Conv2d_2b_3x3,
+            nn.MaxPool2d(3, 2),
+            model.Conv2d_3b_1x1,
+            model.Conv2d_4a_3x3,
+            nn.MaxPool2d(3, 2),
+            model.Mixed_5b,
+            model.Mixed_5c,
+            model.Mixed_5d,
+            model.Mixed_6a,
+            model.Mixed_6b,
+            model.Mixed_6c,
+            model.Mixed_6d,
+            model.Mixed_6e,
+            model.Mixed_7a,
+            model.Mixed_7b,
+            model.Mixed_7c,
             nn.AdaptiveAvgPool2d((1, 1)),
         )
         self.to(device)
@@ -92,11 +78,12 @@ class InceptionFeatureExtractor(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 3, H, W) in [-1,1]; resize to 299x299 for Inception
-        x = torch.nn.functional.interpolate(x, size=(299, 299), mode="bilinear",
-                                             align_corners=False)
-        x = (x + 1.0) / 2.0  # -> [0,1]
-        return self.features(x).squeeze(-1).squeeze(-1)  # (B, 2048)
+
+        x = torch.nn.functional.interpolate(
+            x, size=(299, 299), mode="bilinear", align_corners=False
+        )
+        x = (x + 1.0) / 2.0
+        return self.features(x).squeeze(-1).squeeze(-1)
 
 
 def _compute_stats(feats: np.ndarray):
@@ -117,10 +104,7 @@ def compute_fid(
     real_feats: np.ndarray,
     fake_feats: np.ndarray,
 ) -> float:
-    """
-    Frechet Inception Distance between two sets of Inception features.
-    FID = ||mu_r - mu_f||^2 + Tr(Sigma_r + Sigma_f - 2*sqrt(Sigma_r*Sigma_f))
-    """
+
     mu_r, sig_r = _compute_stats(real_feats)
     mu_f, sig_f = _compute_stats(fake_feats)
     diff = mu_r - mu_f
@@ -134,12 +118,7 @@ def compute_precision_recall(
     fake_feats: np.ndarray,
     k: int = 10,
 ) -> tuple[float, float]:
-    """
-    Compute improved precision and recall on feature embeddings.
 
-    Precision: fraction of generated samples that lie within the manifold of real data.
-    Recall: fraction of real samples covered by the generated manifold.
-    """
     if len(real_feats) <= k or len(fake_feats) <= k:
         return float("nan"), float("nan")
 
@@ -161,8 +140,9 @@ def compute_precision_recall(
     return float(precision), float(recall)
 
 
-def _pairwise_distances(x: np.ndarray, y: np.ndarray, chunk_size: int = 256) -> np.ndarray:
-    """Compute pairwise Euclidean distances without external dependencies."""
+def _pairwise_distances(
+    x: np.ndarray, y: np.ndarray, chunk_size: int = 256
+) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
     x_norm = np.sum(x * x, axis=1, keepdims=True)
@@ -186,19 +166,7 @@ def collect_inception_features(
     device: torch.device,
     is_real: bool = True,
 ) -> np.ndarray:
-    """
-    Collect Inception pool3 features from either real images or a generator.
 
-    Args:
-        inception  : InceptionFeatureExtractor
-        data_iter  : iterable of (images, *) batches  [used if is_real]
-        n_samples  : how many samples to collect
-        device     : torch device
-        is_real    : if True, reads from data_iter; if False, data_iter should be
-                     a callable (generator.generate) returning images
-    Returns:
-        feats: (n_samples, 2048) numpy array
-    """
     feats = []
     collected = 0
     for batch in data_iter:
@@ -214,13 +182,7 @@ def collect_inception_features(
     return np.concatenate(feats, axis=0)[:n_samples]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Metric CSV logger
-# ──────────────────────────────────────────────────────────────────────────────
-
 class MetricLogger:
-    """Logs per-epoch metrics to a CSV file and keeps them in memory."""
-
     FIELDS = [
         "epoch",
         "e_loss",
@@ -240,15 +202,16 @@ class MetricLogger:
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.records: List[Dict] = []
-        # Write header
+
         with open(self.log_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self.FIELDS)
             writer.writeheader()
 
     def log(self, epoch: int, metrics: Dict, elapsed_s: float):
         row = {"epoch": epoch, "elapsed_s": f"{elapsed_s:.1f}"}
-        row.update({k: f"{v:.6f}" if isinstance(v, float) else v
-                    for k, v in metrics.items()})
+        row.update(
+            {k: f"{v:.6f}" if isinstance(v, float) else v for k, v in metrics.items()}
+        )
         self.records.append(row)
         with open(self.log_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self.FIELDS)
@@ -267,10 +230,6 @@ class MetricLogger:
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Sample saving
-# ──────────────────────────────────────────────────────────────────────────────
-
 def save_samples(
     generator,
     n_samples: int,
@@ -279,13 +238,12 @@ def save_samples(
     epoch: int,
     nrow: int = 8,
 ):
-    """Generate and save a grid of images to outputs/samples/."""
     out_dir = Path(output_dir) / "samples"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     generator.eval()
     with torch.no_grad():
-        imgs = generator.generate(n_samples, device)   # (N, C, H, W) in [-1,1]
+        imgs = generator.generate(n_samples, device)
     generator.train()
 
     grid_path = out_dir / f"epoch_{epoch:04d}.png"
@@ -293,34 +251,35 @@ def save_samples(
     print(f"  [Samples] Saved {n_samples} images -> {grid_path}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Training plot
-# ──────────────────────────────────────────────────────────────────────────────
-
 def plot_training_metrics(logger: MetricLogger, output_dir: str):
-    """
-    Plot all tracked metrics after training completes.
-    Saves a multi-panel figure to outputs/training_metrics.png.
-    """
+
     if not logger.records:
         print("[Plot] No records to plot.")
         return
 
     records = logger.records
-    epochs      = [int(r["epoch"]) for r in records]
-    e_loss      = [float(r["e_loss"]) for r in records]
-    g_loss      = [float(r["g_loss"]) for r in records]
-    e_real      = [float(r["e_real"]) for r in records]
-    e_fake      = [float(r["e_fake"]) for r in records]
-    e_real_var  = [float(r.get("e_real_var", "nan")) for r in records]
-    e_fake_var  = [float(r.get("e_fake_var", "nan")) for r in records]
-    gap         = [float(r["gap"]) for r in records]
-    fid         = [float(r["fid"]) for r in records if r["fid"] not in ("nan", "")]
-    precision   = [float(r["precision"]) for r in records if r.get("precision", "nan") not in ("nan", "")]
-    recall      = [float(r["recall"]) for r in records if r.get("recall", "nan") not in ("nan", "")]
+    epochs = [int(r["epoch"]) for r in records]
+    e_loss = [float(r["e_loss"]) for r in records]
+    g_loss = [float(r["g_loss"]) for r in records]
+    e_real = [float(r["e_real"]) for r in records]
+    e_fake = [float(r["e_fake"]) for r in records]
+    e_real_var = [float(r.get("e_real_var", "nan")) for r in records]
+    e_fake_var = [float(r.get("e_fake_var", "nan")) for r in records]
+    gap = [float(r["gap"]) for r in records]
+    fid = [float(r["fid"]) for r in records if r["fid"] not in ("nan", "")]
+    precision = [
+        float(r["precision"])
+        for r in records
+        if r.get("precision", "nan") not in ("nan", "")
+    ]
+    recall = [
+        float(r["recall"]) for r in records if r.get("recall", "nan") not in ("nan", "")
+    ]
 
     fid_epochs = [int(r["epoch"]) for r in records if r["fid"] not in ("nan", "")]
-    pr_epochs = [int(r["epoch"]) for r in records if r.get("precision", "nan") not in ("nan", "")]
+    pr_epochs = [
+        int(r["epoch"]) for r in records if r.get("precision", "nan") not in ("nan", "")
+    ]
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 14))
     fig.suptitle("DEM + DGM Training Metrics", fontsize=16, fontweight="bold")
@@ -334,47 +293,92 @@ def plot_training_metrics(logger: MetricLogger, output_dir: str):
     ax_loss.grid(True, alpha=0.3)
     ax_loss.legend()
 
-    _plot(axes[0, 1], epochs, e_real,      "Mean Energy (Real)",   "E_real",     "seagreen")
-    _plot(axes[0, 2], epochs, e_fake,      "Mean Energy (Fake)",   "E_fake",     "tomato")
-    _plot(axes[1, 0], epochs, e_real_var,   "Energy Variance (Real)", "E_real_var", "forestgreen")
-    _plot(axes[1, 1], epochs, e_fake_var,   "Energy Variance (Fake)", "E_fake_var", "firebrick")
-    _plot(axes[1, 2], epochs, gap,          "Energy Gap (Real-Fake)", "Gap",        "mediumpurple")
+    _plot(axes[0, 1], epochs, e_real, "Mean Energy (Real)", "E_real", "seagreen")
+    _plot(axes[0, 2], epochs, e_fake, "Mean Energy (Fake)", "E_fake", "tomato")
+    _plot(
+        axes[1, 0],
+        epochs,
+        e_real_var,
+        "Energy Variance (Real)",
+        "E_real_var",
+        "forestgreen",
+    )
+    _plot(
+        axes[1, 1],
+        epochs,
+        e_fake_var,
+        "Energy Variance (Fake)",
+        "E_fake_var",
+        "firebrick",
+    )
+    _plot(axes[1, 2], epochs, gap, "Energy Gap (Real-Fake)", "Gap", "mediumpurple")
 
     ax_fid = axes[2, 0]
     if fid:
-        ax_fid.plot(fid_epochs, fid, color="goldenrod", linewidth=2, marker="o",
-                    markersize=4)
+        ax_fid.plot(
+            fid_epochs, fid, color="goldenrod", linewidth=2, marker="o", markersize=4
+        )
         ax_fid.set_title("Fréchet Inception Distance (FID)", fontweight="bold")
         ax_fid.set_xlabel("Epoch")
         ax_fid.set_ylabel("FID")
         ax_fid.grid(True, alpha=0.3)
     else:
-        ax_fid.text(0.5, 0.5, "FID not computed", ha="center", va="center",
-                    transform=ax_fid.transAxes, fontsize=12)
+        ax_fid.text(
+            0.5,
+            0.5,
+            "FID not computed",
+            ha="center",
+            va="center",
+            transform=ax_fid.transAxes,
+            fontsize=12,
+        )
         ax_fid.set_title("FID")
 
     ax_precision = axes[2, 1]
     if precision:
-        ax_precision.plot(pr_epochs, precision, color="slateblue", linewidth=2, marker="o", markersize=4)
+        ax_precision.plot(
+            pr_epochs,
+            precision,
+            color="slateblue",
+            linewidth=2,
+            marker="o",
+            markersize=4,
+        )
         ax_precision.set_title("Precision", fontweight="bold")
         ax_precision.set_xlabel("Epoch")
         ax_precision.set_ylabel("Precision")
         ax_precision.grid(True, alpha=0.3)
     else:
-        ax_precision.text(0.5, 0.5, "Precision not computed", ha="center", va="center",
-                          transform=ax_precision.transAxes, fontsize=12)
+        ax_precision.text(
+            0.5,
+            0.5,
+            "Precision not computed",
+            ha="center",
+            va="center",
+            transform=ax_precision.transAxes,
+            fontsize=12,
+        )
         ax_precision.set_title("Precision")
 
     ax_recall = axes[2, 2]
     if recall:
-        ax_recall.plot(pr_epochs, recall, color="crimson", linewidth=2, marker="o", markersize=4)
+        ax_recall.plot(
+            pr_epochs, recall, color="crimson", linewidth=2, marker="o", markersize=4
+        )
         ax_recall.set_title("Recall", fontweight="bold")
         ax_recall.set_xlabel("Epoch")
         ax_recall.set_ylabel("Recall")
         ax_recall.grid(True, alpha=0.3)
     else:
-        ax_recall.text(0.5, 0.5, "Recall not computed", ha="center", va="center",
-                       transform=ax_recall.transAxes, fontsize=12)
+        ax_recall.text(
+            0.5,
+            0.5,
+            "Recall not computed",
+            ha="center",
+            va="center",
+            transform=ax_recall.transAxes,
+            fontsize=12,
+        )
         ax_recall.set_title("Recall")
 
     plt.tight_layout()
@@ -393,10 +397,6 @@ def _plot(ax, x, y, title, ylabel, color):
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.3f"))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Checkpoint helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
 def save_checkpoint(state: dict, path: str):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, path)
@@ -405,7 +405,6 @@ def save_checkpoint(state: dict, path: str):
 
 
 def load_checkpoint(path: str, dem, dgm, opt_e, opt_g, device) -> int:
-    """Load checkpoint. Returns start epoch."""
     ckpt = torch.load(path, map_location=device)
     dem.load_state_dict(ckpt["dem"])
     dgm.load_state_dict(ckpt["dgm"])
@@ -415,27 +414,25 @@ def load_checkpoint(path: str, dem, dgm, opt_e, opt_g, device) -> int:
     print(f"[Checkpoint] Resumed from epoch {epoch} -> {path}")
     return epoch
 
-import os
-import matplotlib.pyplot as plt
-import pandas as pd
-
-def plot_ablation_cards(df, params_dict, figsize=(28, 10), title_fontsize=24, metrics_fontsize=16):
-    """
-    Plots ablation cards with a cropped bottom to remove extra whitespace.
-    """
+def plot_ablation_cards(
+    df, params_dict, figsize=(28, 10), title_fontsize=24, metrics_fontsize=16
+):
     n = len(df)
-    # Reduced the bottom ratio from 1.5 to 1.1 to tighten the layout
-    fig, axes = plt.subplots(2, n, figsize=figsize, gridspec_kw={'height_ratios': [1, 1.1]})
+
+    fig, axes = plt.subplots(
+        2, n, figsize=figsize, gridspec_kw={"height_ratios": [1, 1.1]}
+    )
 
     if n == 1:
         axes = axes.reshape(2, 1)
 
     for i, row in df.reset_index(drop=True).iterrows():
         exp_name = row["exp_name"]
-        
-        # 1. Top row: Experiment Name and Image
-        axes[0, i].set_title(exp_name, fontsize=title_fontsize, pad=20, fontweight="bold")
-        
+
+        axes[0, i].set_title(
+            exp_name, fontsize=title_fontsize, pad=20, fontweight="bold"
+        )
+
         img_path = os.path.join(row["output_dir"], "samples", "epoch_0030.png")
         try:
             if not os.path.exists(img_path):
@@ -443,12 +440,18 @@ def plot_ablation_cards(df, params_dict, figsize=(28, 10), title_fontsize=24, me
             img = plt.imread(img_path)
             axes[0, i].imshow(img)
         except Exception:
-            axes[0, i].text(0.5, 0.5, "Image Not Found", ha="center", va="center", fontsize=metrics_fontsize)
+            axes[0, i].text(
+                0.5,
+                0.5,
+                "Image Not Found",
+                ha="center",
+                va="center",
+                fontsize=metrics_fontsize,
+            )
         axes[0, i].axis("off")
 
-        # 2. Bottom row: Metrics + Multi-line Parameter Changes
         axes[1, i].axis("off")
-        
+
         run_params = params_dict.get(exp_name, {})
         if not run_params:
             params_text = "Changes:\nNone (Baseline)"
@@ -465,18 +468,17 @@ def plot_ablation_cards(df, params_dict, figsize=(28, 10), title_fontsize=24, me
             f"FID: {row['fid']:.4f}\n\n"
             f"{params_text}"
         )
-        
+
         axes[1, i].text(
-            0.5, 1.0, # Top aligned
+            0.5,
+            1.0,
             text,
-            ha="center", va="top",
+            ha="center",
+            va="top",
             fontsize=metrics_fontsize,
-            linespacing=2.8
+            linespacing=2.8,
         )
 
-    # hspace=0 ensures there is no gap between images and text
-    plt.subplots_adjust(hspace=0, wspace=0.1, bottom=0.2) 
-    
-    # Alternatively, you can use bbox_inches='tight' when saving or showing
-    plt.show()
+    plt.subplots_adjust(hspace=0, wspace=0.1, bottom=0.2)
 
+    plt.show()

@@ -1,4 +1,4 @@
-# Base training configuration mirrored from train.py CONFIG
+
 
 data_root: ./data
 subset_size: 20000

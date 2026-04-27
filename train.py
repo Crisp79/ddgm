@@ -1,32 +1,6 @@
-"""
-train.py
-========
-Training loop for Deep Energy Model (DEM) + Deep Generative Model (DGM).
-Based on: "Deep Directed Generative Models with Energy-Based Probability Estimation"
-          Kim & Bengio, 2016 (arXiv:1606.03439)
-
-Usage:
-    python train.py [--config config.yaml]  OR  edit CONFIG dict below directly.
-
-Hardware target: Intel i7-12700H + NVIDIA RTX 3060 (6 GB VRAM)
-  - Batch size 64 works comfortably within 6 GB.
-  - Mixed precision (AMP) is enabled by default for ~2x speed boost.
-  - FID is computed every `fid_every` epochs with a small sample (~2k) to stay fast.
-
-Key training steps per batch (Eq. 7, 9, 13, 14 in paper):
-  1. DEM update (positive + negative phase):
-       L_E = E_{x+~P_D}[E(x+)] - E_{x-~P_phi}[E(x-)]
-       -> Decrease energy of real data, increase energy of generated data.
-  2. DGM update:
-       L_G = E_{z~P(z)}[E(G(z))]  +  lambda_H * H_reg(G)
-       -> Generator pushes samples toward low energy regions (Eq. 14).
-       -> Entropy regularizer prevents mode collapse (Eq. 15).
-"""
-
 import argparse
 import gc
 import time
-import os
 from pathlib import Path
 
 import torch
@@ -43,89 +17,89 @@ from utils import (
     save_checkpoint,
     load_checkpoint,
     InceptionFeatureExtractor,
-    collect_inception_features,
     compute_fid,
     compute_precision_recall,
 )
 from dataset import get_celeba_loader
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CONFIG  (edit these to customise the run)
-# ──────────────────────────────────────────────────────────────────────────────
+
 CONFIG = {
-    # ── Data ──────────────────────────────────────────────────────────────────
-    "data_root":     "./data",          # root folder containing 'celeba/'
-    "subset_size":   20_000,            # number of CelebA images to use
-    "image_size":    64,
-    "batch_size":    64,                # safe for RTX 3060 6 GB
-    "num_workers":   4,                 # keep ≤ 4 on laptop CPUs
-
-    # ── Model ─────────────────────────────────────────────────────────────────
-    "n_experts":     1024,              # number of product-of-experts units (paper Sec. 4)
-    "feature_dim":   1024,              # DEM/DGM feature map channels
-    "latent_dim":    100,               # z dimensionality (paper Sec. 4)
-    "prior":         "normal",          # 'normal' or 'uniform'
-    "sigma":         1.0,               # DEM global variance
-
-    # ── Training ──────────────────────────────────────────────────────────────
-    "epochs":        100,               # total training epochs (set via CLI or edit here)
-    "lr_e":          1e-4,              # Adam lr for DEM — lower than DGM is key
-    "lr_g":          2e-4,              # Adam lr for DGM
-    "beta1":         0.5,               # Adam beta1 (DCGAN recommendation)
-    "beta2":         0.999,
-    "wd_g":          1e-4,              # weight decay on DGM only (NOT on DEM)
-    "lambda_H":      1e-3,              # entropy regularizer weight (Eq. 15)
-    "r1_gamma":      10.0,              # R1 gradient penalty coefficient for DEM stability
-    "r1_every":      4,                 # apply R1 every N batches (lazy regularisation)
-    "margin":        -1.0,              # DEM fake-energy margin; <=0 disables margin mode
-    "n_gen_steps":   1,                 # DGM updates per DEM update
-    "clip_grad_e":   5.0,               # DEM gradient clip (generous — let energy move)
-    "clip_grad_g":   1.0,               # DGM gradient clip
-
-    # ── Sampling & logging ────────────────────────────────────────────────────
-    "sample_every":  5,                 # save sample grid every N epochs
-    "save_checkpoint_every": 5,         # save numbered checkpoints every N epochs
-    "n_samples":     64,                # images per sample grid
-    "fid_every":     5,                # compute FID every N epochs (slow; set high to skip)
-    "fid_n_samples": 2000,              # samples for FID (2k is fast; 10k is more accurate)
-    "log_interval":  50,                # print loss every N batches
-    "output_dir":    "./outputs",
-
-    # ── Misc ──────────────────────────────────────────────────────────────────
-    "seed":          42,
-    "amp":           True,              # mixed precision (recommended for RTX 3060)
-    "resume":        None,              # path to checkpoint .pt to resume from
-    "device":        "auto",            # 'auto' | 'cuda' | 'cpu'
+    "data_root": "./data",
+    "subset_size": 20_000,
+    "image_size": 64,
+    "batch_size": 64,
+    "num_workers": 4,
+    "n_experts": 1024,
+    "feature_dim": 1024,
+    "latent_dim": 100,
+    "prior": "normal",
+    "sigma": 1.0,
+    "epochs": 100,
+    "lr_e": 1e-4,
+    "lr_g": 2e-4,
+    "beta1": 0.5,
+    "beta2": 0.999,
+    "wd_g": 1e-4,
+    "lambda_H": 1e-3,
+    "r1_gamma": 10.0,
+    "r1_every": 4,
+    "margin": -1.0,
+    "n_gen_steps": 1,
+    "clip_grad_e": 5.0,
+    "clip_grad_g": 1.0,
+    "sample_every": 5,
+    "save_checkpoint_every": 5,
+    "n_samples": 64,
+    "fid_every": 5,
+    "fid_n_samples": 2000,
+    "log_interval": 50,
+    "output_dir": "./outputs",
+    "seed": 42,
+    "amp": True,
+    "resume": None,
+    "device": "auto",
 }
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train DEM + DGM on CelebA")
-    parser.add_argument("--epochs",       type=int,   default=None)
-    parser.add_argument("--sample_every", type=int,   default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--sample_every", type=int, default=None)
     parser.add_argument("--save_checkpoint_every", type=int, default=None)
-    parser.add_argument("--fid_every",    type=int,   default=None)
-    parser.add_argument("--batch_size",   type=int,   default=None)
-    parser.add_argument("--subset_size",  type=int,   default=None)
-    parser.add_argument("--data_root",    type=str,   default=None)
-    parser.add_argument("--output_dir",   type=str,   default=None)
-    parser.add_argument("--lr_e",         type=float, default=None)
-    parser.add_argument("--lr_g",         type=float, default=None)
-    parser.add_argument("--lambda_H",     type=float, default=None)
-    parser.add_argument("--r1_gamma",     type=float, default=None)
-    parser.add_argument("--margin",       type=float, default=None)
-    parser.add_argument("--resume",       type=str,   default=None)
-    parser.add_argument("--no_amp",       action="store_true")
-    parser.add_argument("--seed",         type=int,   default=None)
+    parser.add_argument("--fid_every", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--subset_size", type=int, default=None)
+    parser.add_argument("--data_root", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--lr_e", type=float, default=None)
+    parser.add_argument("--lr_g", type=float, default=None)
+    parser.add_argument("--lambda_H", type=float, default=None)
+    parser.add_argument("--r1_gamma", type=float, default=None)
+    parser.add_argument("--margin", type=float, default=None)
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
 
 def apply_args(cfg, args):
-    """Override CONFIG with any CLI arguments that were explicitly set."""
-    for key in ["epochs", "sample_every", "save_checkpoint_every", "fid_every", "batch_size",
-                "subset_size", "data_root", "output_dir", "lr_e", "lr_g",
-                "lambda_H", "r1_gamma", "margin", "resume", "seed"]:
+    for key in [
+        "epochs",
+        "sample_every",
+        "save_checkpoint_every",
+        "fid_every",
+        "batch_size",
+        "subset_size",
+        "data_root",
+        "output_dir",
+        "lr_e",
+        "lr_g",
+        "lambda_H",
+        "r1_gamma",
+        "margin",
+        "resume",
+        "seed",
+    ]:
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val
@@ -134,21 +108,7 @@ def apply_args(cfg, args):
     return cfg
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Training step helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
 def r1_gradient_penalty(dem, real_imgs: torch.Tensor) -> torch.Tensor:
-    """
-    R1 gradient penalty (Mescheder et al., 2018).
-    Penalises the squared norm of the DEM gradient w.r.t. real images.
-    This is the correct way to regularise an energy function without killing
-    its gradient signal to the generator (unlike spectral norm).
-
-        R1 = (gamma/2) * E_{x~P_D}[ ||grad_x E(x)||^2 ]
-
-    Applied lazily every r1_every batches to save compute.
-    """
     real_imgs = real_imgs.detach().requires_grad_(True)
     e_real = dem(real_imgs).sum()
     grads = torch.autograd.grad(
@@ -162,36 +122,22 @@ def r1_gradient_penalty(dem, real_imgs: torch.Tensor) -> torch.Tensor:
 
 
 def train_dem_step(dem, dgm, real_imgs, scaler_e, opt_e, cfg, device, batch_idx):
-    """
-    Update DEM via Eq. 7 + 9 in paper:
-        L_E = E[E(x+)]  -  E[E(x-)]  +  r1_penalty (every r1_every batches)
-
-    Positive phase: push energy DOWN on real data.
-    Negative phase: push energy UP on generated samples.
-
-    R1 gradient penalty (instead of spectral norm or weight decay on DEM):
-    - Keeps energy function Lipschitz near real data
-    - Does NOT collapse the energy landscape
-    - Does NOT kill the gradient signal to the generator
-    """
     B = real_imgs.size(0)
-    apply_r1 = (batch_idx % cfg["r1_every"] == 0)
+    apply_r1 = batch_idx % cfg["r1_every"] == 0
 
     opt_e.zero_grad(set_to_none=True)
 
-    # ── Contrastive loss (Eq. 7) ──────────────────────────────────────────────
-    with autocast(device_type=device.type, enabled=cfg["amp"] and device.type == "cuda"):
-        e_real = dem(real_imgs)                           # (B,)
+    with autocast(
+        device_type=device.type, enabled=cfg["amp"] and device.type == "cuda"
+    ):
+        e_real = dem(real_imgs)
 
         with torch.no_grad():
             z = dgm.sample_z(B, device)
             fake_imgs = dgm(z)
 
-        e_fake = dem(fake_imgs.detach())                  # (B,)
+        e_fake = dem(fake_imgs.detach())
 
-        # Optional margin loss for negative phase:
-        # margin > 0  => cap fake-energy pushing with hinge term.
-        # margin <= 0 => use standard contrastive objective.
         margin = cfg.get("margin", -1.0)
         if margin > 0:
             loss_e = e_real.mean() + torch.nn.functional.relu(margin - e_fake).mean()
@@ -200,9 +146,7 @@ def train_dem_step(dem, dgm, real_imgs, scaler_e, opt_e, cfg, device, batch_idx)
 
     scaler_e.scale(loss_e).backward()
 
-    # ── R1 gradient penalty (lazy, full precision for stable autograd) ─────────
     if apply_r1:
-        # Must be outside autocast for create_graph=True to work reliably
         penalty = r1_gradient_penalty(dem, real_imgs)
         r1_loss = (cfg["r1_gamma"] / 2.0) * penalty * cfg["r1_every"]
         scaler_e.scale(r1_loss).backward()
@@ -224,25 +168,16 @@ def train_dem_step(dem, dgm, real_imgs, scaler_e, opt_e, cfg, device, batch_idx)
 
 
 def train_dgm_step(dem, dgm, scaler_g, opt_g, cfg, device, batch_size):
-    """
-    Update DGM via Eq. 13 + 14 in paper:
-        L_G = E_z[E_Theta(G(z))]  +  lambda_H * entropy_reg
-
-    The generator pushes samples toward low-energy regions of the DEM.
-    Gradient flows: z -> G(z) -> E(G(z)) -> backprop through both G and E.
-    The DEM must NOT be frozen here — its weights are fixed (opt_e already stepped)
-    but gradients flow through it to reach G.
-    """
     opt_g.zero_grad(set_to_none=True)
-    with autocast(device_type=device.type, enabled=cfg["amp"] and device.type == "cuda"):
+    with autocast(
+        device_type=device.type, enabled=cfg["amp"] and device.type == "cuda"
+    ):
         z = dgm.sample_z(batch_size, device)
-        fake_imgs = dgm(z)                               # (B, C, H, W)
+        fake_imgs = dgm(z)
 
-        # Term 1: push generated samples toward low energy regions (Eq. 14)
-        e_fake_for_g = dem(fake_imgs)                    # (B,) — grad flows through G
+        e_fake_for_g = dem(fake_imgs)
         gen_energy_loss = e_fake_for_g.mean()
 
-        # Term 2: entropy regularizer (Eq. 15) — prevent mode collapse
         entropy_reg = dgm.entropy_regularizer()
 
         loss_g = gen_energy_loss + cfg["lambda_H"] * entropy_reg
@@ -257,12 +192,7 @@ def train_dgm_step(dem, dgm, scaler_g, opt_g, cfg, device, batch_size):
     return loss_g.item()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# FID evaluation
-# ──────────────────────────────────────────────────────────────────────────────
-
 def evaluate_fid(inception, dgm, loader, n_samples, fid_device, gen_device):
-    """Compute FID plus precision/recall between real data and generated samples."""
     print(f"  [FID] Collecting {n_samples} real features...")
     real_feats = []
     collected = 0
@@ -276,6 +206,7 @@ def evaluate_fid(inception, dgm, loader, n_samples, fid_device, gen_device):
         collected += f.shape[0]
 
     import numpy as np
+
     real_feats = np.concatenate(real_feats, axis=0)[:n_samples]
 
     print(f"  [FID] Generating {n_samples} fake features...")
@@ -300,12 +231,8 @@ def evaluate_fid(inception, dgm, loader, n_samples, fid_device, gen_device):
     return fid, precision, recall
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main training loop
-# ──────────────────────────────────────────────────────────────────────────────
-
 def train(cfg: dict):
-    # ── Setup ─────────────────────────────────────────────────────────────────
+
     torch.manual_seed(cfg["seed"])
 
     if cfg["device"] == "auto":
@@ -316,14 +243,12 @@ def train(cfg: dict):
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Data ──────────────────────────────────────────────────────────────────
     loader = get_celeba_loader(
         subset_size=cfg["subset_size"],
         batch_size=cfg["batch_size"],
-        data_path="./data/celeba"
+        data_path="./data/celeba",
     )
 
-    # ── Models ────────────────────────────────────────────────────────────────
     dem = DeepEnergyModel(
         n_experts=cfg["n_experts"],
         feature_dim=cfg["feature_dim"],
@@ -336,16 +261,12 @@ def train(cfg: dict):
         prior=cfg["prior"],
     ).to(device)
 
-    # ── Optimisers ────────────────────────────────────────────────────────────
-    # DEM: NO weight decay — it over-regularises the energy function and
-    #      suppresses the gradient signal reaching the generator.
-    #      Stability is handled by R1 gradient penalty instead.
     opt_e = torch.optim.Adam(
         dem.parameters(),
         lr=cfg["lr_e"],
         betas=(cfg["beta1"], cfg["beta2"]),
     )
-    # DGM: small weight decay prevents generator weights from exploding
+
     opt_g = torch.optim.Adam(
         dgm.parameters(),
         lr=cfg["lr_g"],
@@ -353,25 +274,19 @@ def train(cfg: dict):
         weight_decay=cfg["wd_g"],
     )
 
-    # Separate scalers per model — avoids AMP skipping DEM step when DGM
-    # has an inf/nan gradient (or vice versa), which caused silent training failures.
     amp_enabled = cfg["amp"] and device.type == "cuda"
     scaler_e = GradScaler(device=device.type, enabled=amp_enabled)
     scaler_g = GradScaler(device=device.type, enabled=amp_enabled)
 
-    # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 0
     if cfg["resume"] and Path(cfg["resume"]).exists():
         start_epoch = load_checkpoint(cfg["resume"], dem, dgm, opt_e, opt_g, device)
 
-    # ── Logging ───────────────────────────────────────────────────────────────
     logger = MetricLogger(str(output_dir / "metrics.csv"))
 
-    # ── Inception for FID (lazy init) ─────────────────────────────────────────
     inception = None
     fid_device = device if device.type == "cuda" else torch.device("cpu")
 
-    # ── Training ──────────────────────────────────────────────────────────────
     dem.train()
     dgm.train()
 
@@ -397,12 +312,10 @@ def train(cfg: dict):
             real_imgs = real_imgs.to(device, non_blocking=True)
             B = real_imgs.size(0)
 
-            # ── 1. Update DEM ────────────────────────────────────────────────
             loss_e, e_real, e_fake, e_real_var, e_fake_var = train_dem_step(
                 dem, dgm, real_imgs, scaler_e, opt_e, cfg, device, batch_idx
             )
 
-            # ── 2. Update DGM (n_gen_steps times) ───────────────────────────
             loss_g = 0.0
             for _ in range(cfg["n_gen_steps"]):
                 loss_g += train_dgm_step(dem, dgm, scaler_g, opt_g, cfg, device, B)
@@ -425,16 +338,14 @@ def train(cfg: dict):
 
         progress.close()
 
-        # ── Epoch-level averages ──────────────────────────────────────────────
         avg_e_loss = epoch_e_loss / n_batches
         avg_g_loss = epoch_g_loss / n_batches
         avg_e_real = epoch_e_real / n_batches
         avg_e_fake = epoch_e_fake / n_batches
         avg_e_real_var = epoch_e_real_var / n_batches
         avg_e_fake_var = epoch_e_fake_var / n_batches
-        gap        = avg_e_real - avg_e_fake   # ideally negative & stable
+        gap = avg_e_real - avg_e_fake
 
-        # ── FID ──────────────────────────────────────────────────────────────
         fid = float("nan")
         precision = float("nan")
         recall = float("nan")
@@ -462,7 +373,6 @@ def train(cfg: dict):
 
         elapsed = time.time() - t0
 
-        # ── Log & print ───────────────────────────────────────────────────────
         metrics = {
             "e_loss": avg_e_loss,
             "g_loss": avg_g_loss,
@@ -470,52 +380,46 @@ def train(cfg: dict):
             "e_fake": avg_e_fake,
             "e_real_var": avg_e_real_var,
             "e_fake_var": avg_e_fake_var,
-            "gap":    gap,
-            "fid":    fid if not (fid != fid) else "nan",  # NaN check
+            "gap": gap,
+            "fid": fid if not (fid != fid) else "nan",
             "precision": precision if not (precision != precision) else "nan",
             "recall": recall if not (recall != recall) else "nan",
         }
         logger.log(epoch, metrics, elapsed)
 
-        # ── Samples ───────────────────────────────────────────────────────────
         if epoch % cfg["sample_every"] == 0:
             save_samples(dgm, cfg["n_samples"], device, str(output_dir), epoch)
 
-        # ── Checkpoint ───────────────────────────────────────────────────────
         ckpt_data = {
-                "epoch":    epoch,
-                "dem":      dem.state_dict(),
-                "dgm":      dgm.state_dict(),
-                "opt_e":    opt_e.state_dict(),
-                "opt_g":    opt_g.state_dict(),
-                "scaler_e": scaler_e.state_dict(),
-                "scaler_g": scaler_g.state_dict(),
-                "cfg":      cfg,
-            }
+            "epoch": epoch,
+            "dem": dem.state_dict(),
+            "dgm": dgm.state_dict(),
+            "opt_e": opt_e.state_dict(),
+            "opt_g": opt_g.state_dict(),
+            "scaler_e": scaler_e.state_dict(),
+            "scaler_g": scaler_g.state_dict(),
+            "cfg": cfg,
+        }
         if epoch % cfg["save_checkpoint_every"] == 0:
             save_checkpoint(
                 ckpt_data,
                 str(output_dir / "checkpoints" / f"ckpt_epoch_{epoch:04d}.pt"),
             )
-        save_checkpoint(ckpt_data,
+        save_checkpoint(
+            ckpt_data,
             str(output_dir / "checkpoints" / "latest.pt"),
         )
         print(f"Epoch: {epoch} done")
 
-    # ── Post-training: final samples + metrics plot ───────────────────────────
     print("\n[Training complete] Saving final samples and metrics plot...")
     save_samples(dgm, cfg["n_samples"], device, str(output_dir), epoch=cfg["epochs"])
     plot_training_metrics(logger, str(output_dir))
     print(f"\nAll outputs saved to: {output_dir.resolve()}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     args = parse_args()
-    cfg  = apply_args(CONFIG, args)
+    cfg = apply_args(CONFIG, args)
 
     print("=" * 60)
     print("  DEM + DGM Configuration")
